@@ -267,4 +267,320 @@ Les contributions sont les bienvenues ! Assurez-vous que tous les tests passent 
 
 ---
 
+# 🎯 Tournament Scheduler (RCPSP Algorithm)
+
+## 📋 Description
+
+Le **Tournament Scheduler** implémente un algorithme de planification de tournoi basé sur le **RCPSP** (Resource-Constrained Project Scheduling Problem). Il gère automatiquement la planification des matchs en respectant toutes les contraintes physiques et logiques.
+
+## 🔒 Contraintes Implémentées
+
+### Contraintes Lourdes (Hard Constraints)
+
+1. **Dépendance Séquentielle** (DAG)
+   - Un match ne peut démarrer que si tous ses prérequis sont terminés
+   - Exemple : La finale nécessite que les demi-finales soient finies
+
+2. **Non-Ubiquité des Équipes**
+   - Une équipe ne peut pas jouer deux matchs simultanément
+   - Garantit l'intégrité physique du tournoi
+
+3. **Temps de Repos Obligatoire**
+   - Après un match, une équipe doit se reposer (ex: 15 minutes)
+   - Respecte les contraintes physiologiques
+
+4. **Temps de Préparation des Terrains** (optionnel)
+   - Délai entre deux matchs sur le même terrain
+   - Pour nettoyage, tracé des lignes, etc.
+
+## 🚀 Usage du Scheduler
+
+### Exemple Simple
+
+```typescript
+import { scheduleMatches, Match, Court, SchedulerConfig } from './src';
+
+// Définir les équipes
+const teams = [
+  { id: 1, name: 'Paris Beach' },
+  { id: 2, name: 'Lyon Sand' },
+  { id: 3, name: 'Marseille Waves' },
+  { id: 4, name: 'Nice Spike' },
+];
+
+// Définir les matchs avec dépendances
+const matches: Match[] = [
+  // Demi-finales
+  { id: 'SF1', team1: teams[0], team2: teams[1], round: 1, duration: 45 },
+  { id: 'SF2', team1: teams[2], team2: teams[3], round: 1, duration: 45 },
+
+  // Finale (dépend des demi-finales)
+  {
+    id: 'FINAL',
+    team1: 'Winner SF1',
+    team2: 'Winner SF2',
+    round: 2,
+    duration: 60,
+    dependencies: ['SF1', 'SF2']
+  }
+];
+
+// Définir les terrains disponibles
+const courts: Court[] = [
+  { id: 1, name: 'Centre Court' },
+  { id: 2, name: 'Court 2' }
+];
+
+// Configuration
+const config: SchedulerConfig = {
+  restTime: 15,              // 15 min de repos obligatoire
+  courtSetupTime: 5,         // 5 min de préparation du terrain
+  startTime: new Date('2024-06-15T09:00:00Z')
+};
+
+// Planifier !
+const result = scheduleMatches(matches, courts, config);
+
+// Afficher le planning
+result.schedule.forEach(s => {
+  console.log(
+    `Match ${s.matchId}: Court ${s.courtId}, ` +
+    `${s.startTime.toISOString()} - ${s.endTime.toISOString()}`
+  );
+});
+```
+
+### Sortie du Scheduler
+
+```json
+{
+  "schedule": [
+    {
+      "matchId": "SF1",
+      "courtId": 1,
+      "startTime": "2024-06-15T09:00:00.000Z",
+      "endTime": "2024-06-15T09:45:00.000Z",
+      "round": 1
+    },
+    {
+      "matchId": "SF2",
+      "courtId": 2,
+      "startTime": "2024-06-15T09:00:00.000Z",
+      "endTime": "2024-06-15T09:45:00.000Z",
+      "round": 1
+    },
+    {
+      "matchId": "FINAL",
+      "courtId": 1,
+      "startTime": "2024-06-15T10:05:00.000Z",
+      "endTime": "2024-06-15T11:05:00.000Z",
+      "round": 2
+    }
+  ],
+  "summary": {
+    "totalMatches": 3,
+    "totalDuration": 125,
+    "courtsUsed": 2,
+    "endTime": "2024-06-15T11:05:00.000Z"
+  }
+}
+```
+
+## 🎯 Algorithme de Planification
+
+### Architecture : Task Queue + Event Simulation
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  1. INITIALISATION                                          │
+│     - Créer file d'attente avec matchs sans dépendances     │
+│     - Initialiser état des terrains (libres)                │
+│     - Initialiser état des équipes (disponibles)            │
+└─────────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────┐
+│  2. BOUCLE DE SIMULATION                                    │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ A. Traiter les événements au temps T                 │  │
+│  │    - Libérer terrains                                │  │
+│  │    - Mettre équipes en repos (T + restTime)          │  │
+│  │    - Débloquer matchs dépendants                     │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                           ↓                                 │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ B. Parcourir file d'attente (par priorité: round)   │  │
+│  │    Pour chaque match :                                │  │
+│  │    - Vérifier disponibilité équipes                   │  │
+│  │    - Vérifier terrains libres                         │  │
+│  │    - Si OK : PLANIFIER                                │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                           ↓                                 │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ C. Planifier le match                                │  │
+│  │    - Assigner au terrain disponible                   │  │
+│  │    - Calculer start_time et end_time                  │  │
+│  │    - Marquer équipes occupées                         │  │
+│  │    - Créer événement de fin                           │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                           ↓                                 │
+│  Si rien planifié → Avancer au prochain événement          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────┐
+│  3. RÉSULTAT                                                │
+│     - Planning complet (match → court + horaires)           │
+│     - Statistiques (durée, terrains utilisés, etc.)         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Priorités de Planification
+
+1. **Round Number** : Les matchs du Round 1 avant Round 2, etc.
+2. **Match ID** : Ordre alphabétique pour consistance
+3. **Disponibilité** : Dès que toutes les contraintes sont satisfaites
+
+## 🧪 Validation du Planning
+
+Le scheduler inclut une fonction de validation pour vérifier que toutes les contraintes sont respectées :
+
+```typescript
+import { validateSchedule } from './src';
+
+const validation = validateSchedule(result.schedule, matches, config);
+
+if (validation.valid) {
+  console.log('✅ Planning valide !');
+} else {
+  console.log('❌ Erreurs détectées :');
+  validation.errors.forEach(err => console.log(`  - ${err}`));
+}
+```
+
+### Vérifications Effectuées
+
+- ✅ Aucune équipe ne joue plusieurs matchs simultanément
+- ✅ Temps de repos respecté entre chaque match
+- ✅ Dépendances respectées (ordre chronologique)
+- ✅ Tous les matchs sont planifiés
+
+## 📊 Exemples de Scénarios
+
+### Tournoi à 8 Équipes (2 Terrains)
+
+```typescript
+// 4 quarts de finale → 2 demi-finales → finale + 3e place
+const matches = [
+  // Quarts
+  { id: 'QF1', team1: t1, team2: t8, round: 1, duration: 45 },
+  { id: 'QF2', team1: t4, team2: t5, round: 1, duration: 45 },
+  { id: 'QF3', team1: t2, team2: t7, round: 1, duration: 45 },
+  { id: 'QF4', team1: t3, team2: t6, round: 1, duration: 45 },
+
+  // Demi-finales
+  { id: 'SF1', team1: 'Winner QF1', team2: 'Winner QF2',
+    round: 2, duration: 50, dependencies: ['QF1', 'QF2'] },
+  { id: 'SF2', team1: 'Winner QF3', team2: 'Winner QF4',
+    round: 2, duration: 50, dependencies: ['QF3', 'QF4'] },
+
+  // Finales
+  { id: '3RD', team1: 'Loser SF1', team2: 'Loser SF2',
+    round: 3, duration: 45, dependencies: ['SF1', 'SF2'] },
+  { id: 'FINAL', team1: 'Winner SF1', team2: 'Winner SF2',
+    round: 3, duration: 60, dependencies: ['SF1', 'SF2'] }
+];
+
+const result = scheduleMatches(matches, courts, {
+  restTime: 20,
+  courtSetupTime: 5
+});
+
+// Durée totale : ~4h30 avec 2 terrains
+console.log(`Durée: ${(result.summary.totalDuration / 60).toFixed(1)}h`);
+```
+
+### Terrain Unique (Séquentiel)
+
+```typescript
+const courts = [{ id: 1, name: 'Court Unique' }];
+
+// Avec un seul terrain, tous les matchs sont séquentiels
+// L'algorithme optimise l'ordre pour respecter les dépendances
+const result = scheduleMatches(matches, courts, config);
+
+// Les matchs sans dépendances sont planifiés en premier
+// Puis les matchs dépendants dès que possible
+```
+
+## 🔧 API Reference
+
+### `scheduleMatches(matches, courts, config)`
+
+Planifie tous les matchs en respectant les contraintes.
+
+**Paramètres :**
+- `matches: Match[]` - Liste des matchs avec dépendances
+- `courts: Court[]` - Terrains disponibles
+- `config: SchedulerConfig` - Configuration
+
+**Retourne :** `ScheduleResult`
+
+### Types Principaux
+
+```typescript
+interface Match {
+  id: string | number;
+  team1: Team | string | number;  // Team object ou "Winner M1"
+  team2: Team | string | number;
+  round: number;                   // Priorité (1, 2, 3...)
+  duration: number;                // Durée en minutes
+  dependencies?: (string | number)[];  // IDs des matchs prérequis
+}
+
+interface Court {
+  id: string | number;
+  name: string;
+}
+
+interface SchedulerConfig {
+  restTime: number;           // Minutes de repos entre matchs
+  startTime?: Date;           // Heure de début du tournoi
+  courtSetupTime?: number;    // Minutes de préparation du terrain
+}
+
+interface ScheduledMatch {
+  matchId: string | number;
+  courtId: string | number;
+  startTime: Date;
+  endTime: Date;
+  round: number;
+}
+```
+
+## ⚡ Performance
+
+- **Complexité** : O(M × C × T) où M = matchs, C = terrains, T = temps
+- **Optimisé pour** : Tournois jusqu'à 100+ matchs
+- **Simulation événementielle** : Avance uniquement aux moments critiques
+- **File de priorité** : Traite les matchs par round pour optimisation
+
+## 🎓 Cas d'Usage
+
+✅ **Tournois Beach Volley** (2v2, terrains limités, repos important)
+✅ **Tournois Indoor** (multi-terrains, phase de poules + KO)
+✅ **Compétitions par équipes** (avec contraintes de disponibilité)
+✅ **Simulations** (planification hypothétique de tournois)
+✅ **Edge Functions** (Deno/Supabase compatible)
+
+## 🐛 Détection d'Erreurs
+
+Le scheduler détecte automatiquement :
+- 🔴 Dépendances circulaires (A dépend de B qui dépend de A)
+- 🔴 Références invalides (dépendance vers match inexistant)
+- 🔴 Deadlocks (situation où aucun match ne peut être planifié)
+- 🔴 Configuration invalide (pas de terrains, pas de matchs)
+
+---
+
 **Développé avec ❤️ pour la communauté Volleyball**
