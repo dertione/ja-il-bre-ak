@@ -573,6 +573,106 @@ interface ScheduledMatch {
 ✅ **Simulations** (planification hypothétique de tournois)
 ✅ **Edge Functions** (Deno/Supabase compatible)
 
+## 🔴 Live Reschedule Mode (Temps Réel)
+
+### Gestion en Temps Réel des Tournois
+
+Le mode **Live Reschedule** permet de replanifier les matchs pendant un tournoi en cours, en tenant compte des matchs déjà terminés avec leurs horaires réels.
+
+**Problème résolu** : En tournoi réel, les matchs ne se finissent jamais exactement à l'heure prévue. Certains finissent plus tôt, d'autres plus tard (blessures, prolongations, etc.). Le reschedule adapte automatiquement le planning restant.
+
+### Usage
+
+```typescript
+import { rescheduleMatches, RescheduleConfig } from './src';
+
+// Matches déjà joués avec leurs horaires réels
+const completedMatches: CompletedScheduledMatch[] = [
+  {
+    matchId: 'QF1',
+    courtId: 1,
+    actualStartTime: new Date('2024-06-15T09:00:00Z'),
+    actualEndTime: new Date('2024-06-15T09:48:00Z'), // 3 min de retard
+    team1Id: 'TeamA',
+    team2Id: 'TeamB'
+  },
+  {
+    matchId: 'QF2',
+    courtId: 2,
+    actualStartTime: new Date('2024-06-15T09:00:00Z'),
+    actualEndTime: new Date('2024-06-15T09:40:00Z'), // 5 min d'avance
+    team1Id: 'TeamC',
+    team2Id: 'TeamD'
+  }
+];
+
+// Replanifier les matchs restants
+const result = rescheduleMatches(allMatches, courts, {
+  restTime: 15,
+  currentTime: new Date('2024-06-15T09:50:00Z'), // Heure actuelle
+  completedMatches,
+});
+
+// Résultat : planning mis à jour pour les matchs futurs uniquement
+```
+
+### Fonctionnement
+
+1. **Timeline Painting** : Les matchs complétés "peignent" la timeline
+   - Terrains occupés jusqu'à leur fin réelle + temps de préparation
+   - Équipes indisponibles jusqu'à leur fin réelle + temps de repos
+
+2. **Contrainte Temporelle** : Aucun match planifié dans le passé
+   - `start_time >= current_time` (règle d'or)
+   - Respect du temps actuel du tournoi
+
+3. **Décalage Automatique** : Les matchs pending sont reprogrammés
+   - En fonction des disponibilités réelles des ressources
+   - Les dépendances sont respectées (ex: finale attend demi-finales)
+
+4. **Sortie** : Uniquement les matchs futurs
+   - Les matchs complétés ne sont pas dans le résultat
+   - Planning optimisé depuis l'heure actuelle
+
+### Exemple Concret
+
+**Situation** : 11h00, QF1 fini avec 3 min de retard, QF2 fini avec 5 min d'avance
+
+```
+Planning initial:
+- QF1: 09:00-09:45 ❌ Réel: 09:00-09:48 (+3 min)
+- QF2: 09:00-09:45 ❌ Réel: 09:00-09:40 (-5 min)
+- QF3: 09:50-10:35 → Doit être recalculé
+- SF1: 11:05-11:55 → Doit être recalculé (dépend de QF1, QF2)
+```
+
+```typescript
+const updated = rescheduleMatches(matches, courts, {
+  currentTime: new Date('11:00'),
+  completedMatches: [qf1Actual, qf2Actual]
+});
+
+// QF3 peut commencer à 11:00 (heure actuelle)
+// SF1 doit attendre QF3 + repos des équipes
+```
+
+### Cas d'Usage
+
+✅ **Tournois en direct** : Mettre à jour le planning après chaque match
+✅ **Gestion des retards** : Blessures, prolongations, incidents
+✅ **Communication** : Informer les équipes des horaires réels
+✅ **Optimisation** : Profiter des matches rapides pour avancer
+✅ **Tableau d'affichage** : Afficher les horaires à jour en temps réel
+
+### Différences avec scheduleMatches()
+
+| Aspect | scheduleMatches | rescheduleMatches |
+|--------|-----------------|-------------------|
+| Horaires | Planifie tout depuis début | Planifie depuis current_time |
+| Entrée | Tous les matchs | Matchs + complétés |
+| Sortie | Tous les matchs | Matchs futurs uniquement |
+| Usage | Planning initial | Replanification en direct |
+
 ## 🐛 Détection d'Erreurs
 
 Le scheduler détecte automatiquement :

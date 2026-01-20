@@ -25,16 +25,19 @@ export {
 
 // Tournament Scheduler (RCPSP Algorithm)
 export {
-  // Main scheduling function
+  // Main scheduling functions
   scheduleMatches,
+  rescheduleMatches,
   validateSchedule,
 
   // Types and interfaces
   Match,
   Court,
   SchedulerConfig,
+  RescheduleConfig,
   ScheduledMatch,
   ScheduleResult,
+  CompletedScheduledMatch,
 } from './tournamentScheduler';
 
 // Ranking Engine (Pool Phase Results)
