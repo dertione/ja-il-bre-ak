@@ -583,4 +583,304 @@ Le scheduler détecte automatiquement :
 
 ---
 
+# 🏆 Ranking Engine (Moteur de Classement)
+
+## 📋 Description
+
+Le **Ranking Engine** calcule les classements des équipes après la phase de poules selon deux modes distincts conformes aux règlements FFVB.
+
+## 🎯 Modes de Classement
+
+### Mode A : **Standard** (Championnat / Points)
+
+Hiérarchie FFVB stricte :
+
+1. **Nombre de Victoires** (matchs gagnés)
+2. **Ratio de Sets** (Sets Pour / Sets Contre)
+3. **Ratio de Points** (Points Pour / Points Contre)
+4. **Confrontation Directe** (head-to-head)
+
+### Mode B : **Brésilienne** (Positionnel)
+
+Le classement est déterminé par la **position finale dans l'arbre du template** :
+- Ignore totalement les points et ratios
+- Utilise la métadonnée `rankOutput` des matchs finaux
+- Exemple : Vainqueur Match Final = 1er, Perdant = 2ème
+
+## 🚀 Usage
+
+### Mode Standard
+
+```typescript
+import { calculatePoolRankings, CompletedMatch } from './src';
+
+const matches: CompletedMatch[] = [
+  {
+    id: 'M1',
+    team1Id: 'TeamA',
+    team2Id: 'TeamB',
+    team1Sets: 2,
+    team2Sets: 0,
+    team1Points: 50,
+    team2Points: 40,
+    winnerId: 'TeamA'
+  },
+  // ... autres matchs
+];
+
+const result = calculatePoolRankings(matches, 'standard');
+
+// Afficher classement
+console.log(formatRankings(result));
+
+// Obtenir rang d'une équipe
+const rank = getTeamRank('TeamA', result); // 1
+
+// Obtenir statistiques
+const stats = getTeamStats('TeamA', result);
+console.log(`Victoires: ${stats.wins}, Ratio Sets: ${stats.setRatio}`);
+```
+
+### Mode Brésilienne
+
+```typescript
+const matches: CompletedMatch[] = [
+  { id: 'M1', team1Id: 'A', team2Id: 'B', team1Sets: 2, team2Sets: 0,
+    team1Points: 50, team2Points: 40, winnerId: 'A' },
+  { id: 'FINAL', team1Id: 'A', team2Id: 'C', team1Sets: 2, team2Sets: 1,
+    team1Points: 60, team2Points: 58, winnerId: 'A', rankOutput: 1 },
+  { id: '3RD', team1Id: 'B', team2Id: 'D', team1Sets: 2, team2Sets: 0,
+    team1Points: 50, team2Points: 45, winnerId: 'B', rankOutput: 3 },
+];
+
+const result = calculatePoolRankings(matches, 'brazilian');
+
+// Résultat : 1er: A, 2ème: C, 3ème: B, 4ème: D
+```
+
+## 📊 Sortie du Ranking
+
+```
+=== Pool Rankings (STANDARD) ===
+
+1. Team Paris - 3W-0L | Sets: 6-1 (6.00) | Points: 150-120 (1.25)
+2. Team Lyon - 2W-1L | Sets: 4-3 (1.33) | Points: 140-135 (1.04) | Tie: set-ratio
+3. Team Marseille - 1W-2L | Sets: 3-4 (0.75) | Points: 130-140 (0.93) | Tie: wins
+4. Team Nice - 0W-3L | Sets: 1-6 (0.17) | Points: 115-140 (0.82)
+```
+
+---
+
+# 🔀 Crossover Engine (Moteur de Transition)
+
+## 📋 Description
+
+Le **Crossover Engine** génère automatiquement les matchs de la phase suivante (playoffs, barrages, tableau final) à partir des classements de poules.
+
+## 🎯 Modes de Transition
+
+### Mode 1 : **Crossover** (Croisements Standards)
+
+Système classique avec barrages en serpentin :
+
+```typescript
+const result = generateNextStageMatches(poolRankings, {
+  mode: 'crossover',
+  qualifiersPerPool: 1,  // 1ers qualifiés d'office
+  pattern: 'serpentin'
+});
+
+// Résultat pour 4 poules :
+// - 4 équipes qualifiées directement (1ers de chaque poule)
+// - 4 matchs de barrages : 2A-3D, 2B-3C, 2C-3B, 2D-3A
+```
+
+**Pattern Serpentin :**
+- 2ème Poule A vs 3ème Poule D
+- 2ème Poule B vs 3ème Poule C
+- 2ème Poule C vs 3ème Poule B
+- 2ème Poule D vs 3ème Poule A
+
+### Mode 2 : **Tickets** (Quota)
+
+Système à quota avec meilleurs 2èmes :
+
+```typescript
+const result = generateNextStageMatches(poolRankings, {
+  mode: 'tickets',
+  totalTickets: 6  // 6 équipes avancent
+});
+
+// Avec 4 poules :
+// - 4 premiers qualifiés d'office
+// - 2 places restantes → meilleurs 2èmes (selon critères FFVB)
+```
+
+**Classement des Meilleurs 2èmes** :
+- Utilise les mêmes critères FFVB que le ranking standard
+- Victoires → Ratio sets → Ratio points
+
+### Mode 3 : **Direct** (Qualification Directe)
+
+Top N de chaque poule avancent :
+
+```typescript
+const result = generateNextStageMatches(poolRankings, {
+  mode: 'direct',
+  teamsPerPool: 2  // Top 2 de chaque poule
+});
+
+// 4 poules × 2 équipes = 8 qualifiés
+```
+
+## 🚀 Usage Complet
+
+```typescript
+import {
+  calculatePoolRankings,
+  generateNextStageMatches,
+  PoolRankings
+} from './src';
+
+// 1. Calculer classements de chaque poule
+const poolARankings = calculatePoolRankings(poolAMatches, 'standard');
+const poolBRankings = calculatePoolRankings(poolBMatches, 'standard');
+const poolCRankings = calculatePoolRankings(poolCMatches, 'standard');
+const poolDRankings = calculatePoolRankings(poolDMatches, 'standard');
+
+// 2. Créer structure de rankings
+const poolRankings: PoolRankings[] = [
+  { poolId: 'A', rankings: poolARankings },
+  { poolId: 'B', rankings: poolBRankings },
+  { poolId: 'C', rankings: poolCRankings },
+  { poolId: 'D', rankings: poolDRankings }
+];
+
+// 3. Générer phase suivante
+const transition = generateNextStageMatches(poolRankings, {
+  mode: 'crossover',
+  qualifiersPerPool: 1,
+  pattern: 'serpentin'
+});
+
+// 4. Afficher résultat
+console.log(formatTransitionResult(transition));
+
+// 5. Utiliser les matchs générés
+transition.playoffMatches.forEach(match => {
+  console.log(`${match.description}`);
+  console.log(`  ${match.team1.teamId} vs ${match.team2.teamId}`);
+});
+```
+
+## 📊 Sortie du Crossover
+
+```
+=== Next Stage Transition ===
+
+Direct Qualifiers (4):
+  - 1st A (Team Paris) [direct]
+  - 1st B (Team Lyon) [direct]
+  - 1st C (Team Marseille) [direct]
+  - 1st D (Team Nice) [direct]
+
+Playoff Matches (4):
+  PO-AD-1: Playoff: 2nd A vs 3rd D
+  PO-BC-2: Playoff: 2nd B vs 3rd C
+  PO-CB-3: Playoff: 2nd C vs 3rd B
+  PO-DA-4: Playoff: 2nd D vs 3rd A
+
+Summary: 4 qualified, 4 playoffs, 0 bracket matches
+```
+
+---
+
+# 🎓 Workflow Complet
+
+## Exemple de Tournoi de A à Z
+
+```typescript
+import {
+  // Pool Distribution
+  distributeTeamsToPools,
+
+  // Match Scheduling
+  scheduleMatches,
+
+  // Rankings
+  calculatePoolRankings,
+
+  // Crossover
+  generateNextStageMatches
+} from './src';
+
+// 1. Distribution en poules (Snake Seeding)
+const teams = [/* 12 équipes avec seeds */];
+const poolDistribution = distributeTeamsToPools(teams, 4);
+
+// 2. Planification des matchs de poule
+const poolMatches = [/* générer matchs de poule */];
+const schedule = scheduleMatches(poolMatches, courts, config);
+
+// 3. Simulation/Résultats des matchs
+const completedMatches = [/* matchs avec résultats */];
+
+// 4. Calcul des classements
+const rankings = calculatePoolRankings(completedMatches, 'standard');
+
+// 5. Génération de la phase suivante
+const transition = generateNextStageMatches(poolRankings, {
+  mode: 'crossover',
+  qualifiersPerPool: 1
+});
+
+// 6. Planification des playoffs
+const playoffSchedule = scheduleMatches(
+  transition.playoffMatches,
+  courts,
+  config
+);
+
+// → Tournoi complet automatisé ! 🏐
+```
+
+## 📦 Scripts d'Exemples
+
+```bash
+# Distribution en poules
+npm run example:pools
+
+# Planification de matchs
+npm run example:scheduler
+
+# Workflow complet (pools → matchs → ranking → playoffs)
+npm run example:complete
+```
+
+---
+
+# 📚 API Reference Complète
+
+## Pool Distribution
+- `distributeTeamsToPools(teams, poolCount, config?)`
+- `calculatePoolSizes(teamCount, poolCount)`
+- `snakeSeeding(teams, poolSizes)`
+
+## Tournament Scheduler
+- `scheduleMatches(matches, courts, config)`
+- `validateSchedule(schedule, matches, config)`
+
+## Ranking Engine
+- `calculatePoolRankings(matches, method, config?)`
+- `getTeamRank(teamId, result)`
+- `getTeamStats(teamId, result)`
+- `formatRankings(result)`
+
+## Crossover Engine
+- `generateNextStageMatches(poolRankings, config)`
+- `validatePoolRankings(poolRankings)`
+- `formatTransitionResult(result)`
+
+---
+
 **Développé avec ❤️ pour la communauté Volleyball**
