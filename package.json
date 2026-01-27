@@ -10,7 +10,8 @@
     "test:watch": "jest --watch",
     "example:pools": "ts-node examples/example.ts",
     "example:scheduler": "ts-node examples/schedulerExample.ts",
-    "example:complete": "ts-node examples/completeTournamentExample.ts"
+    "example:complete": "ts-node examples/completeTournamentExample.ts",
+    "example:reschedule": "ts-node examples/liveRescheduleExample.ts"
   },
   "keywords": [
     "volleyball",
