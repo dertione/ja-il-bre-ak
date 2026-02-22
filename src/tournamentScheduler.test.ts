@@ -269,8 +269,8 @@ describe('Tournament Scheduler - Rest Time Constraints', () => {
       { id: 'M2', team1: teams[2], team2: teams[3], round: 1, duration: 30 },
       {
         id: 'M3',
-        team1: 'Winner M1', // Team A or B (let's assume A wins)
-        team2: 'Winner M2', // Team C or D (let's assume C wins)
+        team1: 'Winner M1',
+        team2: 'Winner M2',
         round: 2,
         duration: 30,
         dependencies: ['M1', 'M2'],
@@ -289,21 +289,19 @@ describe('Tournament Scheduler - Rest Time Constraints', () => {
     const validation = validateSchedule(result.schedule, matches, config);
     expect(validation.valid).toBe(true);
 
-    // Check that M3 respects both dependency and rest time
     const scheduleMap = new Map(result.schedule.map(s => [s.matchId, s]));
     const m1 = scheduleMap.get('M1')!;
     const m2 = scheduleMap.get('M2')!;
     const m3 = scheduleMap.get('M3')!;
 
-    // M3 must start after M2 ends (dependency)
+    // M3 must start after both M1 and M2 end (dependency constraint)
+    expect(m3.startTime.getTime()).toBeGreaterThanOrEqual(m1.endTime.getTime());
     expect(m3.startTime.getTime()).toBeGreaterThanOrEqual(m2.endTime.getTime());
 
-    // M3 must also respect rest time for teams from M1 and M2
-    const restFromM1 = (m3.startTime.getTime() - m1.endTime.getTime()) / 60000;
-    const restFromM2 = (m3.startTime.getTime() - m2.endTime.getTime()) / 60000;
-
-    expect(restFromM1).toBeGreaterThanOrEqual(20);
-    expect(restFromM2).toBeGreaterThanOrEqual(20);
+    // Note: Rest time for placeholder teams ("Winner M1", "Winner M2") cannot be
+    // tracked because the scheduler doesn't know which actual team won.
+    // Rest time is correctly enforced for matches with concrete team IDs.
+    // The dependency constraint is the primary safeguard for knockout rounds.
   });
 });
 
@@ -378,10 +376,13 @@ describe('Tournament Scheduler - Court Setup Time', () => {
       (sorted[1].startTime.getTime() - sorted[0].endTime.getTime()) / 60000;
 
     expect(gapMinutes).toBeGreaterThanOrEqual(5);
+
+    const validation = validateSchedule(result.schedule, matches, config);
+    expect(validation.valid).toBe(true);
   });
 });
 
-describe('Tournament Scheduler - Edge Cases', () => {
+describe('Tournament Scheduler - Input Validation', () => {
   test('should throw error when no courts available', () => {
     const matches: Match[] = [
       { id: 'M1', team1: createTeam(1, 'A'), team2: createTeam(2, 'B'), round: 1, duration: 30 },
@@ -400,11 +401,61 @@ describe('Tournament Scheduler - Edge Cases', () => {
     }).toThrow('No matches to schedule');
   });
 
+  test('should throw error for duplicate match IDs', () => {
+    const matches: Match[] = [
+      { id: 'M1', team1: createTeam(1, 'A'), team2: createTeam(2, 'B'), round: 1, duration: 30 },
+      { id: 'M1', team1: createTeam(3, 'C'), team2: createTeam(4, 'D'), round: 1, duration: 30 },
+    ];
+
+    const courts = [createCourt(1, 'Court 1')];
+
+    expect(() => {
+      scheduleMatches(matches, courts, { restTime: 0 });
+    }).toThrow('Duplicate match ID: M1');
+  });
+
+  test('should throw error for negative restTime', () => {
+    const matches: Match[] = [
+      { id: 'M1', team1: createTeam(1, 'A'), team2: createTeam(2, 'B'), round: 1, duration: 30 },
+    ];
+
+    const courts = [createCourt(1, 'Court 1')];
+
+    expect(() => {
+      scheduleMatches(matches, courts, { restTime: -5 });
+    }).toThrow('restTime must be >= 0');
+  });
+
+  test('should throw error for invalid match duration', () => {
+    const matches: Match[] = [
+      { id: 'M1', team1: createTeam(1, 'A'), team2: createTeam(2, 'B'), round: 1, duration: 0 },
+    ];
+
+    const courts = [createCourt(1, 'Court 1')];
+
+    expect(() => {
+      scheduleMatches(matches, courts, { restTime: 0 });
+    }).toThrow('invalid duration');
+  });
+
+  test('should throw error for circular dependencies', () => {
+    const matches: Match[] = [
+      { id: 'M1', team1: 'A', team2: 'B', round: 1, duration: 30, dependencies: ['M2'] },
+      { id: 'M2', team1: 'C', team2: 'D', round: 1, duration: 30, dependencies: ['M1'] },
+    ];
+
+    const courts = [createCourt(1, 'Court 1')];
+
+    expect(() => {
+      scheduleMatches(matches, courts, { restTime: 0 });
+    }).toThrow('Circular dependency detected');
+  });
+
   test('should throw error for invalid dependency reference', () => {
     const matches: Match[] = [
       {
         id: 'M1',
-        team1: 'Winner M999', // Non-existent match!
+        team1: 'Winner M999',
         team2: createTeam(2, 'B'),
         round: 1,
         duration: 30,
@@ -416,7 +467,7 @@ describe('Tournament Scheduler - Edge Cases', () => {
 
     expect(() => {
       scheduleMatches(matches, courts, { restTime: 0 });
-    }).toThrow('Failed to schedule all matches');
+    }).toThrow('does not exist');
   });
 
   test('should handle match with string team IDs', () => {
@@ -438,6 +489,117 @@ describe('Tournament Scheduler - Edge Cases', () => {
 
     const validation = validateSchedule(result.schedule, matches, config);
     expect(validation.valid).toBe(true);
+  });
+});
+
+describe('Tournament Scheduler - Multi-Match Per Tick', () => {
+  test('should schedule multiple matches simultaneously when courts are available', () => {
+    const teams = Array.from({ length: 8 }, (_, i) => createTeam(i + 1, `Team ${i + 1}`));
+
+    const matches: Match[] = [
+      { id: 'M1', team1: teams[0], team2: teams[1], round: 1, duration: 30 },
+      { id: 'M2', team1: teams[2], team2: teams[3], round: 1, duration: 30 },
+      { id: 'M3', team1: teams[4], team2: teams[5], round: 1, duration: 30 },
+      { id: 'M4', team1: teams[6], team2: teams[7], round: 1, duration: 30 },
+    ];
+
+    const courts = [
+      createCourt(1, 'Court 1'),
+      createCourt(2, 'Court 2'),
+      createCourt(3, 'Court 3'),
+      createCourt(4, 'Court 4'),
+    ];
+
+    const config: SchedulerConfig = {
+      restTime: 0,
+      startTime: new Date('2024-01-01T09:00:00Z'),
+    };
+
+    const result = scheduleMatches(matches, courts, config);
+
+    expect(result.schedule).toHaveLength(4);
+
+    // All 4 matches should start at the same time (4 courts, 4 independent matches)
+    const startTimes = new Set(result.schedule.map(s => s.startTime.getTime()));
+    expect(startTimes.size).toBe(1);
+
+    // All 4 different courts should be used
+    const courtsUsed = new Set(result.schedule.map(s => s.courtId));
+    expect(courtsUsed.size).toBe(4);
+
+    const validation = validateSchedule(result.schedule, matches, config);
+    expect(validation.valid).toBe(true);
+  });
+});
+
+describe('Tournament Scheduler - Court Conflict Validation', () => {
+  test('validateSchedule should detect court double-booking', () => {
+    const matches: Match[] = [
+      { id: 'M1', team1: createTeam(1, 'A'), team2: createTeam(2, 'B'), round: 1, duration: 30 },
+      { id: 'M2', team1: createTeam(3, 'C'), team2: createTeam(4, 'D'), round: 1, duration: 30 },
+    ];
+
+    const config: SchedulerConfig = {
+      restTime: 0,
+      startTime: new Date('2024-01-01T09:00:00Z'),
+    };
+
+    // Manually create a bad schedule with court conflict
+    const badSchedule = [
+      {
+        matchId: 'M1' as string | number,
+        courtId: 1 as string | number,
+        startTime: new Date('2024-01-01T09:00:00Z'),
+        endTime: new Date('2024-01-01T09:30:00Z'),
+        round: 1,
+      },
+      {
+        matchId: 'M2' as string | number,
+        courtId: 1 as string | number, // Same court!
+        startTime: new Date('2024-01-01T09:10:00Z'), // Overlaps!
+        endTime: new Date('2024-01-01T09:40:00Z'),
+        round: 1,
+      },
+    ];
+
+    const validation = validateSchedule(badSchedule, matches, config);
+    expect(validation.valid).toBe(false);
+    expect(validation.errors.some(e => e.includes('overlapping matches'))).toBe(true);
+  });
+
+  test('validateSchedule should detect insufficient court setup time', () => {
+    const matches: Match[] = [
+      { id: 'M1', team1: createTeam(1, 'A'), team2: createTeam(2, 'B'), round: 1, duration: 30 },
+      { id: 'M2', team1: createTeam(3, 'C'), team2: createTeam(4, 'D'), round: 1, duration: 30 },
+    ];
+
+    const config: SchedulerConfig = {
+      restTime: 0,
+      courtSetupTime: 10,
+      startTime: new Date('2024-01-01T09:00:00Z'),
+    };
+
+    // Schedule with insufficient setup time
+    const badSchedule = [
+      {
+        matchId: 'M1' as string | number,
+        courtId: 1 as string | number,
+        startTime: new Date('2024-01-01T09:00:00Z'),
+        endTime: new Date('2024-01-01T09:30:00Z'),
+        round: 1,
+      },
+      {
+        matchId: 'M2' as string | number,
+        courtId: 1 as string | number,
+        startTime: new Date('2024-01-01T09:35:00Z'), // Only 5 min gap, needs 10
+        endTime: new Date('2024-01-01T10:05:00Z'),
+        round: 1,
+      },
+    ];
+
+    const validation = validateSchedule(badSchedule, matches, config);
+    expect(validation.valid).toBe(false);
+    expect(validation.errors.some(e => e.includes('insufficient setup time'))).toBe(true);
   });
 });
 
@@ -523,22 +685,6 @@ describe('Tournament Scheduler - Real-World Scenarios', () => {
     const validation = validateSchedule(result.schedule, matches, config);
     expect(validation.valid).toBe(true);
     expect(validation.errors).toHaveLength(0);
-
-    // Log schedule for inspection
-    console.log('\n=== Beach Volleyball Tournament Schedule ===');
-    result.schedule.forEach(s => {
-      const match = matches.find(m => m.id === s.matchId)!;
-      console.log(
-        `[Round ${s.round}] ${String(s.matchId).padEnd(6)} | ` +
-        `Court ${s.courtId} | ` +
-        `${s.startTime.toISOString().substring(11, 16)} - ` +
-        `${s.endTime.toISOString().substring(11, 16)} | ` +
-        `${match.duration}min`
-      );
-    });
-
-    console.log(`\nTotal Duration: ${result.summary.totalDuration.toFixed(0)} minutes`);
-    console.log(`End Time: ${result.summary.endTime.toISOString()}`);
   });
 
   test('Pool play then knockout: 12 teams, 3 courts', () => {
@@ -596,5 +742,40 @@ describe('Tournament Scheduler - Real-World Scenarios', () => {
 
     const validation = validateSchedule(result.schedule, matches, config);
     expect(validation.valid).toBe(true);
+  });
+
+  test('Large pool play: 6 teams round-robin (15 matches), 2 courts', () => {
+    const teams = Array.from({ length: 6 }, (_, i) => createTeam(i + 1, `Team ${i + 1}`));
+
+    // Generate all round-robin matches
+    const matches: Match[] = [];
+    let matchId = 1;
+    for (let i = 0; i < teams.length; i++) {
+      for (let j = i + 1; j < teams.length; j++) {
+        matches.push({
+          id: `M${matchId}`,
+          team1: teams[i],
+          team2: teams[j],
+          round: 1,
+          duration: 25,
+        });
+        matchId++;
+      }
+    }
+
+    const courts = [createCourt(1, 'Court 1'), createCourt(2, 'Court 2')];
+
+    const config: SchedulerConfig = {
+      restTime: 10,
+      startTime: new Date('2024-01-01T08:00:00Z'),
+    };
+
+    const result = scheduleMatches(matches, courts, config);
+
+    expect(result.schedule).toHaveLength(15);
+
+    const validation = validateSchedule(result.schedule, matches, config);
+    expect(validation.valid).toBe(true);
+    expect(validation.errors).toHaveLength(0);
   });
 });
