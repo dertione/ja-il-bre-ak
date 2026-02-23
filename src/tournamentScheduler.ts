@@ -41,12 +41,22 @@ export interface Match {
 }
 
 /**
+ * Day boundary for multi-day tournaments.
+ * Defines when a day ends and when the next day starts.
+ */
+export interface DayBoundary {
+  dayEndTime: Date;
+  nextDayStartTime: Date;
+}
+
+/**
  * Configuration for the scheduler
  */
 export interface SchedulerConfig {
   restTime: number;           // Minimum rest time in minutes between matches for a team
   startTime?: Date;           // Tournament start time (defaults to now)
   courtSetupTime?: number;    // Time needed between matches on same court (default: 0)
+  dayBoundaries?: DayBoundary[];  // Multi-day support: when play must stop and resume
 }
 
 /**
@@ -352,6 +362,42 @@ interface SchedulerContext {
   courtSetupTime: number;
   initialTime: Date;        // Start time for ensureTeamState
   minStartTime: Date;       // Floor for scheduling (= startTime in normal, = currentTime in reschedule)
+  dayBoundaries: DayBoundary[];
+}
+
+/**
+ * Adjusts a proposed start time to respect day boundaries.
+ * If the match would cross a boundary or start in the overnight gap,
+ * pushes start to the next day's start time.
+ */
+function adjustForDayBoundaries(
+  startTime: Date,
+  durationMinutes: number,
+  dayBoundaries: DayBoundary[]
+): Date {
+  if (dayBoundaries.length === 0) return startTime;
+
+  let adjusted = new Date(startTime);
+
+  // Sort boundaries chronologically
+  const sorted = [...dayBoundaries].sort(
+    (a, b) => a.dayEndTime.getTime() - b.dayEndTime.getTime()
+  );
+
+  for (const boundary of sorted) {
+    const endTime = new Date(adjusted.getTime() + durationMinutes * 60000);
+
+    // Start is in the overnight gap
+    if (adjusted >= boundary.dayEndTime && adjusted < boundary.nextDayStartTime) {
+      adjusted = new Date(boundary.nextDayStartTime);
+    }
+    // Match would cross the boundary
+    else if (adjusted < boundary.dayEndTime && endTime > boundary.dayEndTime) {
+      adjusted = new Date(boundary.nextDayStartTime);
+    }
+  }
+
+  return adjusted;
 }
 
 /**
@@ -408,6 +454,7 @@ function runSchedulingLoop(ctx: SchedulerContext): void {
     //    Loop until no more matches can be scheduled at this tick
     let scheduledAny = false;
     let scheduledThisPass = true;
+    let earliestFutureStart: Date | null = null;
 
     while (scheduledThisPass) {
       scheduledThisPass = false;
@@ -424,12 +471,27 @@ function runSchedulingLoop(ctx: SchedulerContext): void {
         if (!result) continue;
 
         // Ensure we don't schedule before the minimum allowed time
-        const actualStart = result.startTime < ctx.minStartTime
+        let actualStart = result.startTime < ctx.minStartTime
           ? ctx.minStartTime
           : result.startTime;
 
+        // Apply day boundary adjustments
+        if (ctx.dayBoundaries.length > 0) {
+          actualStart = adjustForDayBoundaries(
+            actualStart,
+            task.match.duration,
+            ctx.dayBoundaries
+          );
+        }
+
         // Only schedule if the match can start right now (at currentTime)
-        if (actualStart > currentTime) continue;
+        if (actualStart > currentTime) {
+          // Track earliest future start for time advancement
+          if (!earliestFutureStart || actualStart < earliestFutureStart) {
+            earliestFutureStart = actualStart;
+          }
+          continue;
+        }
 
         // Schedule the match
         const endTime = new Date(actualStart.getTime() + task.match.duration * 60000);
@@ -495,6 +557,12 @@ function runSchedulingLoop(ctx: SchedulerContext): void {
 
         if (ctx.minStartTime > currentTime && ctx.minStartTime < nextTime) {
           nextTime = ctx.minStartTime;
+        }
+
+        // Consider day boundary adjustments: if a match was pushed to a future
+        // day start, use that as a candidate for time advancement
+        if (earliestFutureStart && earliestFutureStart < nextTime) {
+          nextTime = earliestFutureStart;
         }
 
         if (nextTime.getTime() < 8640000000000000) {
@@ -617,6 +685,7 @@ export function scheduleMatches(
     courtSetupTime,
     initialTime: startTime,
     minStartTime: startTime,
+    dayBoundaries: config.dayBoundaries || [],
   };
 
   runSchedulingLoop(ctx);
@@ -794,6 +863,21 @@ export function validateSchedule(
     }
   }
 
+  // Check 6: Day boundary respect
+  if (config.dayBoundaries) {
+    for (const scheduled of schedule) {
+      for (const boundary of config.dayBoundaries) {
+        if (scheduled.startTime < boundary.dayEndTime && scheduled.endTime > boundary.dayEndTime) {
+          errors.push(
+            `Match ${scheduled.matchId} crosses day boundary: ` +
+            `starts ${scheduled.startTime.toISOString()} ends ${scheduled.endTime.toISOString()} ` +
+            `but day ends at ${boundary.dayEndTime.toISOString()}`
+          );
+        }
+      }
+    }
+  }
+
   return {
     valid: errors.length === 0,
     errors,
@@ -938,6 +1022,7 @@ export function rescheduleMatches(
     courtSetupTime,
     initialTime: earliestTime,
     minStartTime: currentTime,  // Cannot schedule in the past
+    dayBoundaries: config.dayBoundaries || [],
   };
 
   runSchedulingLoop(ctx);

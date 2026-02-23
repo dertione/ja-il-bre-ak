@@ -779,3 +779,161 @@ describe('Tournament Scheduler - Real-World Scenarios', () => {
     expect(validation.errors).toHaveLength(0);
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+// Multi-Day Support Tests
+// ─────────────────────────────────────────────────────────────
+
+describe('Tournament Scheduler - Multi-Day Support', () => {
+  const teamA = createTeam(1, 'Team A');
+  const teamB = createTeam(2, 'Team B');
+  const teamC = createTeam(3, 'Team C');
+  const teamD = createTeam(4, 'Team D');
+  const courts = [createCourt(1, 'Court 1')];
+
+  test('should not schedule match that would cross day boundary', () => {
+    // Day ends at 17:00, next day starts at 08:00
+    const matches: Match[] = [
+      { id: 'M1', team1: teamA, team2: teamB, round: 1, duration: 30 },
+      { id: 'M2', team1: teamC, team2: teamD, round: 1, duration: 30 },
+    ];
+
+    const config: SchedulerConfig = {
+      restTime: 0,
+      courtSetupTime: 0,
+      startTime: new Date('2024-06-15T16:40:00Z'), // 16:40 — M1 fits (ends 17:10) but...
+      dayBoundaries: [{
+        dayEndTime: new Date('2024-06-15T17:00:00Z'),
+        nextDayStartTime: new Date('2024-06-16T08:00:00Z'),
+      }],
+    };
+
+    const result = scheduleMatches(matches, courts, config);
+
+    // M1 starts at 16:40, would end at 17:10 — crosses boundary, pushed to next day
+    // Actually M1 starts at 16:40 and can't fit 30min before 17:00, so pushed
+    for (const s of result.schedule) {
+      const validation = validateSchedule(result.schedule, matches, config);
+      expect(validation.valid).toBe(true);
+    }
+  });
+
+  test('should push match to next day when it cannot fit before day end', () => {
+    // Day ends at 17:00, next day starts at 08:00
+    // Start at 16:45 with a 30-min match -> would end at 17:15 -> push to 08:00 next day
+    const matches: Match[] = [
+      { id: 'M1', team1: teamA, team2: teamB, round: 1, duration: 30 },
+    ];
+
+    const config: SchedulerConfig = {
+      restTime: 0,
+      startTime: new Date('2024-06-15T16:45:00Z'),
+      dayBoundaries: [{
+        dayEndTime: new Date('2024-06-15T17:00:00Z'),
+        nextDayStartTime: new Date('2024-06-16T08:00:00Z'),
+      }],
+    };
+
+    const result = scheduleMatches(matches, courts, config);
+
+    expect(result.schedule[0].startTime).toEqual(new Date('2024-06-16T08:00:00Z'));
+    expect(result.schedule[0].endTime).toEqual(new Date('2024-06-16T08:30:00Z'));
+  });
+
+  test('should correctly handle rest time across day boundary', () => {
+    // Team A plays M1, then needs rest. But the overnight break should satisfy rest time.
+    const matches: Match[] = [
+      { id: 'M1', team1: teamA, team2: teamB, round: 1, duration: 30 },
+      { id: 'M2', team1: teamA, team2: teamC, round: 2, duration: 30, dependencies: ['M1'] },
+    ];
+
+    const config: SchedulerConfig = {
+      restTime: 15, // 15 min rest, but overnight gap is much larger
+      startTime: new Date('2024-06-15T16:00:00Z'),
+      courtSetupTime: 0,
+      dayBoundaries: [{
+        dayEndTime: new Date('2024-06-15T17:00:00Z'),
+        nextDayStartTime: new Date('2024-06-16T08:00:00Z'),
+      }],
+    };
+
+    const result = scheduleMatches(matches, courts, config);
+    const validation = validateSchedule(result.schedule, matches, config);
+    expect(validation.valid).toBe(true);
+
+    // M1 starts at 16:00, ends at 16:30. Team A available at 16:45.
+    // M2 needs 30 min, starting at 16:45 would end at 17:15 -> crosses boundary -> pushed to 08:00
+    const m2 = result.schedule.find(s => s.matchId === 'M2')!;
+    expect(m2.startTime).toEqual(new Date('2024-06-16T08:00:00Z'));
+  });
+
+  test('should validate schedule against day boundaries', () => {
+    // Manually create a schedule that crosses a day boundary and validate
+    const matches: Match[] = [
+      { id: 'M1', team1: teamA, team2: teamB, round: 1, duration: 30 },
+    ];
+
+    // Fake a schedule that crosses the boundary
+    const badSchedule = [{
+      matchId: 'M1' as string | number,
+      courtId: 1 as string | number,
+      startTime: new Date('2024-06-15T16:45:00Z'),
+      endTime: new Date('2024-06-15T17:15:00Z'),
+      round: 1,
+    }];
+
+    const config: SchedulerConfig = {
+      restTime: 0,
+      dayBoundaries: [{
+        dayEndTime: new Date('2024-06-15T17:00:00Z'),
+        nextDayStartTime: new Date('2024-06-16T08:00:00Z'),
+      }],
+    };
+
+    const validation = validateSchedule(badSchedule, matches, config);
+    expect(validation.valid).toBe(false);
+    expect(validation.errors.length).toBeGreaterThan(0);
+    expect(validation.errors[0]).toContain('crosses day boundary');
+  });
+
+  test('should handle 2-day tournament with many matches', () => {
+    // 4 teams, 6 round-robin matches + semis + final
+    const twoCourts = [createCourt(1, 'Court 1'), createCourt(2, 'Court 2')];
+
+    const matches: Match[] = [
+      // Round-robin
+      { id: 'M1', team1: teamA, team2: teamB, round: 1, duration: 30 },
+      { id: 'M2', team1: teamC, team2: teamD, round: 1, duration: 30 },
+      { id: 'M3', team1: teamA, team2: teamC, round: 2, duration: 30 },
+      { id: 'M4', team1: teamB, team2: teamD, round: 2, duration: 30 },
+      { id: 'M5', team1: teamA, team2: teamD, round: 3, duration: 30 },
+      { id: 'M6', team1: teamB, team2: teamC, round: 3, duration: 30 },
+      // Semis
+      { id: 'SF1', team1: 'Winner Pool', team2: 'Runner Pool', round: 4, duration: 45,
+        dependencies: ['M1', 'M2', 'M3', 'M4', 'M5', 'M6'] },
+      { id: 'SF2', team1: '3rd Pool', team2: '4th Pool', round: 4, duration: 45,
+        dependencies: ['M1', 'M2', 'M3', 'M4', 'M5', 'M6'] },
+      // Final
+      { id: 'F', team1: 'Winner SF1', team2: 'Winner SF2', round: 5, duration: 45,
+        dependencies: ['SF1', 'SF2'] },
+    ];
+
+    // Day 1: 14:00 - 18:00, Day 2: 08:00 - 18:00
+    const config: SchedulerConfig = {
+      restTime: 15,
+      courtSetupTime: 5,
+      startTime: new Date('2024-06-15T14:00:00Z'),
+      dayBoundaries: [{
+        dayEndTime: new Date('2024-06-15T18:00:00Z'),
+        nextDayStartTime: new Date('2024-06-16T08:00:00Z'),
+      }],
+    };
+
+    const result = scheduleMatches(matches, twoCourts, config);
+
+    expect(result.schedule).toHaveLength(9);
+
+    const validation = validateSchedule(result.schedule, matches, config);
+    expect(validation.valid).toBe(true);
+  });
+});
