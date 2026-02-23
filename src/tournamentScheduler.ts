@@ -2,9 +2,11 @@
  * RCPSP-based Tournament Scheduler for Beach Volleyball
  *
  * Implements a constraint-based scheduling algorithm that handles:
- * - Sequential dependencies (DAG)
- * - Resource constraints (team non-ubiquity)
+ * - Sequential dependencies (DAG with cycle detection)
+ * - Resource constraints (team non-ubiquity, court exclusivity)
  * - Rest time requirements (physiological buffer)
+ * - Court setup time between matches
+ * - Live reschedule mode for ongoing tournaments
  */
 
 /**
@@ -39,12 +41,22 @@ export interface Match {
 }
 
 /**
+ * Day boundary for multi-day tournaments.
+ * Defines when a day ends and when the next day starts.
+ */
+export interface DayBoundary {
+  dayEndTime: Date;
+  nextDayStartTime: Date;
+}
+
+/**
  * Configuration for the scheduler
  */
 export interface SchedulerConfig {
   restTime: number;           // Minimum rest time in minutes between matches for a team
   startTime?: Date;           // Tournament start time (defaults to now)
   courtSetupTime?: number;    // Time needed between matches on same court (default: 0)
+  dayBoundaries?: DayBoundary[];  // Multi-day support: when play must stop and resume
 }
 
 /**
@@ -105,7 +117,7 @@ interface TeamState {
  */
 interface CourtState {
   courtId: string | number;
-  availableAt: Date;        // When the court becomes available
+  availableAt: Date;        // When the court becomes available (after setup)
   currentMatch: string | number | null;
 }
 
@@ -115,7 +127,6 @@ interface CourtState {
 interface MatchTask {
   match: Match;
   remainingDependencies: Set<string | number>;  // Dependencies not yet satisfied
-  scheduledAt?: Date;
 }
 
 /**
@@ -126,9 +137,12 @@ interface Event {
   type: 'MATCH_END';
   matchId: string | number;
   courtId: string | number;
-  team1Id: string | number;
-  team2Id: string | number;
+  teamIds: (string | number)[];
 }
+
+// ─────────────────────────────────────────────────────────────
+// Helper functions
+// ─────────────────────────────────────────────────────────────
 
 /**
  * Extracts team IDs from a match, handling both direct teams and dependency placeholders
@@ -138,13 +152,13 @@ function getTeamIds(match: Match): (string | number)[] {
 
   if (typeof match.team1 === 'object' && match.team1 !== null) {
     teams.push((match.team1 as Team).id);
-  } else if (match.team1) {
+  } else if (match.team1 !== undefined && match.team1 !== null) {
     teams.push(match.team1);
   }
 
   if (typeof match.team2 === 'object' && match.team2 !== null) {
     teams.push((match.team2 as Team).id);
-  } else if (match.team2) {
+  } else if (match.team2 !== undefined && match.team2 !== null) {
     teams.push(match.team2);
   }
 
@@ -152,100 +166,145 @@ function getTeamIds(match: Match): (string | number)[] {
 }
 
 /**
- * Checks if a team is available to play at a given time
+ * Calculates when a match can earliest start based on all resource constraints
+ * Returns the earliest Date when both teams and at least one court are free.
  */
-function isTeamAvailable(
-  teamId: string | number,
-  time: Date,
-  teamStates: Map<string | number, TeamState>
-): boolean {
-  const state = teamStates.get(teamId);
-  if (!state) {
-    return true; // Team not yet tracked, so available
-  }
-
-  return state.currentMatch === null && state.availableAt <= time;
-}
-
-/**
- * Checks if all teams in a match are available
- */
-function areTeamsAvailable(
+function calculateEarliestStart(
   match: Match,
-  time: Date,
-  teamStates: Map<string | number, TeamState>
-): boolean {
+  baseTime: Date,
+  teamStates: Map<string | number, TeamState>,
+  courtStates: CourtState[],
+): { startTime: Date; court: CourtState } | null {
   const teamIds = getTeamIds(match);
-  return teamIds.every(teamId => isTeamAvailable(teamId, time, teamStates));
-}
 
-/**
- * Finds the next available court at or after the given time
- */
-function findAvailableCourt(
-  time: Date,
-  courtStates: CourtState[]
-): { court: CourtState; availableAt: Date } | null {
-  let earliestCourt: CourtState | null = null;
-  let earliestTime = new Date(8640000000000000); // Max date
-
-  for (const court of courtStates) {
-    if (court.availableAt <= time && court.currentMatch === null) {
-      return { court, availableAt: time };
-    }
-
-    if (court.availableAt < earliestTime) {
-      earliestTime = court.availableAt;
-      earliestCourt = court;
-    }
-  }
-
-  if (earliestCourt) {
-    return { court: earliestCourt, availableAt: earliestCourt.availableAt };
-  }
-
-  return null;
-}
-
-/**
- * Calculates when a match can start based on team availability
- */
-function calculateEarliestStartTime(
-  match: Match,
-  currentTime: Date,
-  teamStates: Map<string | number, TeamState>
-): Date {
-  const teamIds = getTeamIds(match);
-  let earliestStart = currentTime;
-
+  // 1. Calculate earliest team availability
+  let teamEarliest = baseTime;
   for (const teamId of teamIds) {
     const state = teamStates.get(teamId);
-    if (state && state.availableAt > earliestStart) {
-      earliestStart = state.availableAt;
+    if (!state) continue;
+    // Team must not be in a current match
+    if (state.currentMatch !== null) return null;
+    if (state.availableAt > teamEarliest) {
+      teamEarliest = state.availableAt;
     }
   }
 
-  return earliestStart;
+  // 2. Find the best court: free at or before teamEarliest, with no currentMatch
+  let bestCourt: CourtState | null = null;
+  let bestStartTime = new Date(8640000000000000);
+
+  for (const court of courtStates) {
+    if (court.currentMatch !== null) continue; // Court is occupied — skip
+    // The actual start is max(teamEarliest, court.availableAt)
+    const courtStart = court.availableAt > teamEarliest ? court.availableAt : teamEarliest;
+    if (courtStart < bestStartTime) {
+      bestStartTime = courtStart;
+      bestCourt = court;
+    }
+  }
+
+  if (!bestCourt) return null;
+
+  return { startTime: bestStartTime, court: bestCourt };
 }
 
 /**
- * Creates or updates team state
+ * Creates or gets team state
  */
 function ensureTeamState(
   teamId: string | number,
   teamStates: Map<string | number, TeamState>,
   initialTime: Date
 ): TeamState {
-  if (!teamStates.has(teamId)) {
-    const state: TeamState = {
+  let state = teamStates.get(teamId);
+  if (!state) {
+    state = {
       teamId,
       availableAt: initialTime,
       currentMatch: null,
     };
     teamStates.set(teamId, state);
-    return state;
   }
-  return teamStates.get(teamId)!;
+  return state;
+}
+
+/**
+ * Detects cycles in the dependency DAG using DFS.
+ * Throws an error with a clear message if a cycle is found.
+ */
+function detectCycles(matchMap: Map<string | number, MatchTask>): void {
+  const WHITE = 0, GRAY = 1, BLACK = 2;
+  const color = new Map<string | number, number>();
+
+  for (const id of matchMap.keys()) {
+    color.set(id, WHITE);
+  }
+
+  function dfs(id: string | number, path: (string | number)[]): void {
+    color.set(id, GRAY);
+    const task = matchMap.get(id);
+    if (!task) return;
+
+    for (const depId of task.match.dependencies || []) {
+      const depColor = color.get(depId);
+      if (depColor === undefined) continue; // dependency outside of match set (invalid ref)
+      if (depColor === GRAY) {
+        const cycleStart = path.indexOf(depId);
+        const cycle = [...path.slice(cycleStart), depId];
+        throw new Error(
+          `Circular dependency detected: ${cycle.join(' → ')}`
+        );
+      }
+      if (depColor === WHITE) {
+        dfs(depId, [...path, depId]);
+      }
+    }
+
+    color.set(id, BLACK);
+  }
+
+  for (const id of matchMap.keys()) {
+    if (color.get(id) === WHITE) {
+      dfs(id, [id]);
+    }
+  }
+}
+
+/**
+ * Validates inputs common to both schedule and reschedule
+ */
+function validateInputs(matches: Match[], courts: Court[], config: SchedulerConfig): void {
+  if (matches.length === 0) {
+    throw new Error('No matches to schedule');
+  }
+
+  if (courts.length === 0) {
+    throw new Error('No courts available');
+  }
+
+  if (config.restTime < 0) {
+    throw new Error('restTime must be >= 0');
+  }
+
+  if (config.courtSetupTime !== undefined && config.courtSetupTime < 0) {
+    throw new Error('courtSetupTime must be >= 0');
+  }
+
+  // Check for duplicate match IDs
+  const ids = new Set<string | number>();
+  for (const match of matches) {
+    if (ids.has(match.id)) {
+      throw new Error(`Duplicate match ID: ${match.id}`);
+    }
+    ids.add(match.id);
+  }
+
+  // Validate match durations
+  for (const match of matches) {
+    if (match.duration <= 0) {
+      throw new Error(`Match ${match.id} has invalid duration: ${match.duration}`);
+    }
+  }
 }
 
 /**
@@ -258,21 +317,11 @@ class MatchQueue {
   enqueue(task: MatchTask): void {
     this.tasks.push(task);
     this.tasks.sort((a, b) => {
-      // Sort by round first (lower rounds have higher priority)
       if (a.match.round !== b.match.round) {
         return a.match.round - b.match.round;
       }
-      // Then by match ID for consistency
       return String(a.match.id).localeCompare(String(b.match.id));
     });
-  }
-
-  dequeue(): MatchTask | undefined {
-    return this.tasks.shift();
-  }
-
-  peek(): MatchTask | undefined {
-    return this.tasks[0];
   }
 
   isEmpty(): boolean {
@@ -296,6 +345,246 @@ class MatchQueue {
     return false;
   }
 }
+
+// ─────────────────────────────────────────────────────────────
+// Core scheduling engine (shared between schedule and reschedule)
+// ─────────────────────────────────────────────────────────────
+
+interface SchedulerContext {
+  queue: MatchQueue;
+  events: Event[];
+  schedule: ScheduledMatch[];
+  teamStates: Map<string | number, TeamState>;
+  courtStates: CourtState[];
+  dependents: Map<string | number, Set<string | number>>;
+  matchMap: Map<string | number, MatchTask>;
+  restTime: number;
+  courtSetupTime: number;
+  initialTime: Date;        // Start time for ensureTeamState
+  minStartTime: Date;       // Floor for scheduling (= startTime in normal, = currentTime in reschedule)
+  dayBoundaries: DayBoundary[];
+}
+
+/**
+ * Adjusts a proposed start time to respect day boundaries.
+ * If the match would cross a boundary or start in the overnight gap,
+ * pushes start to the next day's start time.
+ */
+function adjustForDayBoundaries(
+  startTime: Date,
+  durationMinutes: number,
+  dayBoundaries: DayBoundary[]
+): Date {
+  if (dayBoundaries.length === 0) return startTime;
+
+  let adjusted = new Date(startTime);
+
+  // Sort boundaries chronologically
+  const sorted = [...dayBoundaries].sort(
+    (a, b) => a.dayEndTime.getTime() - b.dayEndTime.getTime()
+  );
+
+  for (const boundary of sorted) {
+    const endTime = new Date(adjusted.getTime() + durationMinutes * 60000);
+
+    // Start is in the overnight gap
+    if (adjusted >= boundary.dayEndTime && adjusted < boundary.nextDayStartTime) {
+      adjusted = new Date(boundary.nextDayStartTime);
+    }
+    // Match would cross the boundary
+    else if (adjusted < boundary.dayEndTime && endTime > boundary.dayEndTime) {
+      adjusted = new Date(boundary.nextDayStartTime);
+    }
+  }
+
+  return adjusted;
+}
+
+/**
+ * Core event-driven scheduling loop.
+ * Shared between scheduleMatches and rescheduleMatches.
+ */
+function runSchedulingLoop(ctx: SchedulerContext): void {
+  let currentTime = new Date(ctx.minStartTime);
+  let iterations = 0;
+  const maxIterations = ctx.queue.size() * ctx.courtStates.length * 1000 + 10000;
+
+  while (!ctx.queue.isEmpty() || ctx.events.length > 0) {
+    iterations++;
+    if (iterations > maxIterations) {
+      throw new Error(
+        `Scheduling exceeded maximum iterations (${maxIterations}). ` +
+        `Remaining in queue: ${ctx.queue.size()}, events: ${ctx.events.length}`
+      );
+    }
+
+    // 1. Process all events at or before currentTime
+    while (ctx.events.length > 0 && ctx.events[0].time <= currentTime) {
+      const event = ctx.events.shift()!;
+
+      // Free up the court
+      const court = ctx.courtStates.find(c => c.courtId === event.courtId);
+      if (court) {
+        court.currentMatch = null;
+        court.availableAt = new Date(event.time.getTime() + ctx.courtSetupTime * 60000);
+      }
+
+      // Free up teams and set their rest time
+      const restEndTime = new Date(event.time.getTime() + ctx.restTime * 60000);
+      for (const teamId of event.teamIds) {
+        const teamState = ensureTeamState(teamId, ctx.teamStates, ctx.initialTime);
+        teamState.currentMatch = null;
+        teamState.availableAt = restEndTime;
+      }
+
+      // Unlock dependent matches
+      const deps = ctx.dependents.get(event.matchId) || new Set();
+      for (const depMatchId of deps) {
+        const depTask = ctx.matchMap.get(depMatchId);
+        if (depTask) {
+          depTask.remainingDependencies.delete(event.matchId);
+          if (depTask.remainingDependencies.size === 0) {
+            ctx.queue.enqueue(depTask);
+          }
+        }
+      }
+    }
+
+    // 2. Try to schedule as many matches as possible at currentTime
+    //    Loop until no more matches can be scheduled at this tick
+    let scheduledAny = false;
+    let scheduledThisPass = true;
+    let earliestFutureStart: Date | null = null;
+
+    while (scheduledThisPass) {
+      scheduledThisPass = false;
+      const queueSnapshot = ctx.queue.getAll();
+
+      for (const task of queueSnapshot) {
+        const result = calculateEarliestStart(
+          task.match,
+          currentTime,
+          ctx.teamStates,
+          ctx.courtStates
+        );
+
+        if (!result) continue;
+
+        // Ensure we don't schedule before the minimum allowed time
+        let actualStart = result.startTime < ctx.minStartTime
+          ? ctx.minStartTime
+          : result.startTime;
+
+        // Apply day boundary adjustments
+        if (ctx.dayBoundaries.length > 0) {
+          actualStart = adjustForDayBoundaries(
+            actualStart,
+            task.match.duration,
+            ctx.dayBoundaries
+          );
+        }
+
+        // Only schedule if the match can start right now (at currentTime)
+        if (actualStart > currentTime) {
+          // Track earliest future start for time advancement
+          if (!earliestFutureStart || actualStart < earliestFutureStart) {
+            earliestFutureStart = actualStart;
+          }
+          continue;
+        }
+
+        // Schedule the match
+        const endTime = new Date(actualStart.getTime() + task.match.duration * 60000);
+        const teamIds = getTeamIds(task.match);
+
+        ctx.schedule.push({
+          matchId: task.match.id,
+          courtId: result.court.courtId,
+          startTime: actualStart,
+          endTime,
+          round: task.match.round,
+        });
+
+        // Update court state
+        result.court.currentMatch = task.match.id;
+        result.court.availableAt = endTime;
+
+        // Update team states
+        for (const teamId of teamIds) {
+          const teamState = ensureTeamState(teamId, ctx.teamStates, ctx.initialTime);
+          teamState.currentMatch = task.match.id;
+        }
+
+        // Create end event
+        ctx.events.push({
+          time: endTime,
+          type: 'MATCH_END',
+          matchId: task.match.id,
+          courtId: result.court.courtId,
+          teamIds,
+        });
+
+        // Keep events sorted by time
+        ctx.events.sort((a, b) => a.time.getTime() - b.time.getTime());
+
+        // Remove from queue
+        ctx.queue.remove(task.match.id);
+        scheduledThisPass = true;
+        scheduledAny = true;
+        break; // Restart from highest priority after each scheduling
+      }
+    }
+
+    // 3. If nothing was scheduled, advance time
+    if (!scheduledAny) {
+      if (ctx.events.length > 0) {
+        currentTime = ctx.events[0].time;
+      } else if (!ctx.queue.isEmpty()) {
+        // No events but queue not empty — advance to earliest resource availability
+        let nextTime = new Date(8640000000000000);
+
+        for (const state of ctx.teamStates.values()) {
+          if (state.availableAt > currentTime && state.availableAt < nextTime) {
+            nextTime = state.availableAt;
+          }
+        }
+
+        for (const court of ctx.courtStates) {
+          if (court.availableAt > currentTime && court.availableAt < nextTime) {
+            nextTime = court.availableAt;
+          }
+        }
+
+        if (ctx.minStartTime > currentTime && ctx.minStartTime < nextTime) {
+          nextTime = ctx.minStartTime;
+        }
+
+        // Consider day boundary adjustments: if a match was pushed to a future
+        // day start, use that as a candidate for time advancement
+        if (earliestFutureStart && earliestFutureStart < nextTime) {
+          nextTime = earliestFutureStart;
+        }
+
+        if (nextTime.getTime() < 8640000000000000) {
+          currentTime = nextTime;
+        } else {
+          const remaining = ctx.queue.getAll().map(t => t.match.id);
+          throw new Error(
+            `Scheduling deadlock detected. ` +
+            `Unable to schedule matches: [${remaining.join(', ')}]. ` +
+            `Check for circular dependencies or invalid dependency references.`
+          );
+        }
+      } else {
+        break; // Done
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────
 
 /**
  * Main scheduling algorithm - schedules matches respecting all constraints
@@ -327,28 +616,13 @@ export function scheduleMatches(
   config: SchedulerConfig
 ): ScheduleResult {
   // Validation
-  if (matches.length === 0) {
-    throw new Error('No matches to schedule');
-  }
-
-  if (courts.length === 0) {
-    throw new Error('No courts available');
-  }
+  validateInputs(matches, courts, config);
 
   const startTime = config.startTime || new Date();
   const restTime = config.restTime;
   const courtSetupTime = config.courtSetupTime || 0;
 
-  // Initialize data structures
-  const schedule: ScheduledMatch[] = [];
-  const teamStates = new Map<string | number, TeamState>();
-  const courtStates: CourtState[] = courts.map(court => ({
-    courtId: court.id,
-    availableAt: startTime,
-    currentMatch: null,
-  }));
-
-  // Build dependency graph
+  // Build dependency graph and detect cycles
   const matchMap = new Map<string | number, MatchTask>();
   const dependents = new Map<string | number, Set<string | number>>();
 
@@ -359,7 +633,6 @@ export function scheduleMatches(
       remainingDependencies: new Set(deps),
     });
 
-    // Build reverse mapping (match -> its dependents)
     for (const depId of deps) {
       if (!dependents.has(depId)) {
         dependents.set(depId, new Set());
@@ -368,164 +641,62 @@ export function scheduleMatches(
     }
   }
 
+  // Detect circular dependencies upfront
+  detectCycles(matchMap);
+
+  // Validate dependency references
+  for (const match of matches) {
+    for (const depId of match.dependencies || []) {
+      if (!matchMap.has(depId)) {
+        throw new Error(
+          `Match ${match.id} depends on ${depId} which does not exist in the match list`
+        );
+      }
+    }
+  }
+
+  // Initialize state
+  const teamStates = new Map<string | number, TeamState>();
+  const courtStates: CourtState[] = courts.map(court => ({
+    courtId: court.id,
+    availableAt: startTime,
+    currentMatch: null,
+  }));
+
   // Initialize queue with matches that have no dependencies
   const queue = new MatchQueue();
-  for (const [matchId, task] of matchMap.entries()) {
+  for (const [, task] of matchMap.entries()) {
     if (task.remainingDependencies.size === 0) {
       queue.enqueue(task);
     }
   }
 
-  // Event queue for simulation
-  const events: Event[] = [];
-  let currentTime = new Date(startTime);
+  // Run the scheduling loop
+  const schedule: ScheduledMatch[] = [];
+  const ctx: SchedulerContext = {
+    queue,
+    events: [],
+    schedule,
+    teamStates,
+    courtStates,
+    dependents,
+    matchMap,
+    restTime,
+    courtSetupTime,
+    initialTime: startTime,
+    minStartTime: startTime,
+    dayBoundaries: config.dayBoundaries || [],
+  };
 
-  // Main scheduling loop
-  while (!queue.isEmpty() || events.length > 0) {
-    // Process all events at current time
-    while (events.length > 0 && events[0].time <= currentTime) {
-      const event = events.shift()!;
-
-      // Free up the court
-      const court = courtStates.find(c => c.courtId === event.courtId);
-      if (court) {
-        court.currentMatch = null;
-        court.availableAt = new Date(event.time.getTime() + courtSetupTime * 60000);
-      }
-
-      // Free up teams and set their rest time
-      const restEndTime = new Date(event.time.getTime() + restTime * 60000);
-
-      const team1State = ensureTeamState(event.team1Id, teamStates, startTime);
-      team1State.currentMatch = null;
-      team1State.availableAt = restEndTime;
-
-      const team2State = ensureTeamState(event.team2Id, teamStates, startTime);
-      team2State.currentMatch = null;
-      team2State.availableAt = restEndTime;
-
-      // Unlock dependent matches
-      const deps = dependents.get(event.matchId) || new Set();
-      for (const depMatchId of deps) {
-        const depTask = matchMap.get(depMatchId);
-        if (depTask) {
-          depTask.remainingDependencies.delete(event.matchId);
-
-          // If all dependencies satisfied, add to queue
-          if (depTask.remainingDependencies.size === 0) {
-            queue.enqueue(depTask);
-          }
-        }
-      }
-    }
-
-    // Try to schedule matches from queue
-    let scheduled = false;
-    const queueSnapshot = queue.getAll();
-
-    for (const task of queueSnapshot) {
-      // Check if teams are available
-      if (!areTeamsAvailable(task.match, currentTime, teamStates)) {
-        continue;
-      }
-
-      // Find available court
-      const courtResult = findAvailableCourt(currentTime, courtStates);
-      if (!courtResult) {
-        continue;
-      }
-
-      // Calculate actual start time (may be later than current time if teams need rest)
-      const teamEarliestStart = calculateEarliestStartTime(task.match, currentTime, teamStates);
-      const actualStartTime = new Date(Math.max(
-        courtResult.availableAt.getTime(),
-        teamEarliestStart.getTime()
-      ));
-
-      // If start time is in the future, skip for now
-      if (actualStartTime > currentTime) {
-        continue;
-      }
-
-      // Schedule the match!
-      const endTime = new Date(actualStartTime.getTime() + task.match.duration * 60000);
-
-      schedule.push({
-        matchId: task.match.id,
-        courtId: courtResult.court.courtId,
-        startTime: actualStartTime,
-        endTime,
-        round: task.match.round,
-      });
-
-      // Update court state
-      courtResult.court.currentMatch = task.match.id;
-      courtResult.court.availableAt = endTime;
-
-      // Update team states
-      const teamIds = getTeamIds(task.match);
-      for (const teamId of teamIds) {
-        const teamState = ensureTeamState(teamId, teamStates, startTime);
-        teamState.currentMatch = task.match.id;
-        // Note: availableAt will be set when match ends
-      }
-
-      // Create end event
-      events.push({
-        time: endTime,
-        type: 'MATCH_END',
-        matchId: task.match.id,
-        courtId: courtResult.court.courtId,
-        team1Id: teamIds[0],
-        team2Id: teamIds[1],
-      });
-
-      // Sort events by time
-      events.sort((a, b) => a.time.getTime() - b.time.getTime());
-
-      // Remove from queue
-      queue.remove(task.match.id);
-      scheduled = true;
-      break; // Start over to maintain priority order
-    }
-
-    // If nothing was scheduled, advance time to next event
-    if (!scheduled) {
-      if (events.length > 0) {
-        currentTime = events[0].time;
-      } else if (!queue.isEmpty()) {
-        // No events but queue not empty - need to advance time
-        // Find earliest time when any team or court becomes available
-        let nextTime = new Date(8640000000000000); // Max date
-
-        for (const state of teamStates.values()) {
-          if (state.availableAt > currentTime && state.availableAt < nextTime) {
-            nextTime = state.availableAt;
-          }
-        }
-
-        for (const court of courtStates) {
-          if (court.availableAt > currentTime && court.availableAt < nextTime) {
-            nextTime = court.availableAt;
-          }
-        }
-
-        if (nextTime.getTime() < 8640000000000000) {
-          currentTime = nextTime;
-        } else {
-          // Should not happen if algorithm is correct
-          throw new Error('Scheduling deadlock detected');
-        }
-      } else {
-        break; // Done
-      }
-    }
-  }
+  runSchedulingLoop(ctx);
 
   // Verify all matches were scheduled
   if (schedule.length !== matches.length) {
+    const scheduledIds = new Set(schedule.map(s => s.matchId));
+    const unscheduled = matches.filter(m => !scheduledIds.has(m.id)).map(m => m.id);
     throw new Error(
       `Failed to schedule all matches. Scheduled: ${schedule.length}, Total: ${matches.length}. ` +
+      `Unscheduled: [${unscheduled.join(', ')}]. ` +
       `Possible circular dependency or invalid dependency reference.`
     );
   }
@@ -577,7 +748,6 @@ export function validateSchedule(
 
       const occupancy = teamOccupancy.get(teamId)!;
 
-      // Check for overlap
       for (const other of occupancy) {
         if (
           (scheduled.startTime >= other.start && scheduled.startTime < other.end) ||
@@ -609,7 +779,7 @@ export function validateSchedule(
 
       const restTimeMinutes = (curr.start.getTime() - prev.end.getTime()) / 60000;
 
-      if (restTimeMinutes < config.restTime) {
+      if (restTimeMinutes < config.restTime - 0.001) { // Tolerance for floating point
         errors.push(
           `Team ${teamId} has insufficient rest between matches ${prev.matchId} and ${curr.matchId}: ` +
           `${restTimeMinutes.toFixed(1)} minutes < ${config.restTime} minutes required`
@@ -642,6 +812,72 @@ export function validateSchedule(
     }
   }
 
+  // Check 4: No court double-booking
+  const courtOccupancy = new Map<string | number, { start: Date; end: Date; matchId: string | number }[]>();
+
+  for (const scheduled of schedule) {
+    if (!courtOccupancy.has(scheduled.courtId)) {
+      courtOccupancy.set(scheduled.courtId, []);
+    }
+
+    const occupancy = courtOccupancy.get(scheduled.courtId)!;
+
+    for (const other of occupancy) {
+      if (
+        (scheduled.startTime >= other.start && scheduled.startTime < other.end) ||
+        (scheduled.endTime > other.start && scheduled.endTime <= other.end) ||
+        (scheduled.startTime <= other.start && scheduled.endTime >= other.end)
+      ) {
+        errors.push(
+          `Court ${scheduled.courtId} has overlapping matches: ` +
+          `${scheduled.matchId} and ${other.matchId}`
+        );
+      }
+    }
+
+    occupancy.push({
+      start: scheduled.startTime,
+      end: scheduled.endTime,
+      matchId: scheduled.matchId,
+    });
+  }
+
+  // Check 5: Court setup time respected
+  const setupTime = config.courtSetupTime || 0;
+  if (setupTime > 0) {
+    for (const [courtId, occupancy] of courtOccupancy.entries()) {
+      const sorted = occupancy.sort((a, b) => a.start.getTime() - b.start.getTime());
+
+      for (let i = 1; i < sorted.length; i++) {
+        const prev = sorted[i - 1];
+        const curr = sorted[i];
+        const gap = (curr.start.getTime() - prev.end.getTime()) / 60000;
+
+        if (gap < setupTime - 0.001) { // Tolerance for floating point
+          errors.push(
+            `Court ${courtId} has insufficient setup time between matches ${prev.matchId} and ${curr.matchId}: ` +
+            `${gap.toFixed(1)} minutes < ${setupTime} minutes required`
+          );
+        }
+      }
+    }
+  }
+
+  // Check 6: Day boundary respect
+  if (config.dayBoundaries) {
+    for (const scheduled of schedule) {
+      for (const boundary of config.dayBoundaries) {
+        if (scheduled.startTime < boundary.dayEndTime && scheduled.endTime > boundary.dayEndTime) {
+          errors.push(
+            `Match ${scheduled.matchId} crosses day boundary: ` +
+            `starts ${scheduled.startTime.toISOString()} ends ${scheduled.endTime.toISOString()} ` +
+            `but day ends at ${boundary.dayEndTime.toISOString()}`
+          );
+        }
+      }
+    }
+  }
+
   return {
     valid: errors.length === 0,
     errors,
@@ -669,14 +905,12 @@ export function validateSchedule(
  *       matchId: 'M1',
  *       courtId: 1,
  *       actualStartTime: new Date('2024-06-15T09:00:00Z'),
- *       actualEndTime: new Date('2024-06-15T09:47:00Z'),  // 2 min longer than planned
+ *       actualEndTime: new Date('2024-06-15T09:47:00Z'),
  *       team1Id: 'TeamA',
  *       team2Id: 'TeamB'
  *     }
  *   ]
  * });
- *
- * // Result contains only pending matches, rescheduled from current time
  * ```
  */
 export function rescheduleMatches(
@@ -685,46 +919,32 @@ export function rescheduleMatches(
   config: RescheduleConfig
 ): ScheduleResult {
   // Validation
-  if (matches.length === 0) {
-    throw new Error('No matches to schedule');
-  }
-
-  if (courts.length === 0) {
-    throw new Error('No courts available');
-  }
+  validateInputs(matches, courts, config);
 
   const currentTime = config.currentTime;
   const completedMatchIds = new Set(config.completedMatches.map(m => m.matchId));
   const restTime = config.restTime;
   const courtSetupTime = config.courtSetupTime || 0;
 
+  // Determine the earliest known time for initialization
+  const earliestTime = config.startTime || (
+    config.completedMatches.length > 0
+      ? new Date(Math.min(...config.completedMatches.map(m => m.actualStartTime.getTime())))
+      : currentTime
+  );
+
   // Separate completed and pending matches
   const pendingMatches = matches.filter(m => !completedMatchIds.has(m.id));
-  const completedMatchMap = new Map(config.completedMatches.map(m => [m.matchId, m]));
 
-  // Initialize schedule with completed matches (for validation purposes)
-  const schedule: ScheduledMatch[] = [];
-
-  // Add completed matches to schedule
-  for (const completed of config.completedMatches) {
-    schedule.push({
-      matchId: completed.matchId,
-      courtId: completed.courtId,
-      startTime: completed.actualStartTime,
-      endTime: completed.actualEndTime,
-      round: matches.find(m => m.id === completed.matchId)?.round || 0,
-    });
-  }
-
-  // Paint timeline with completed matches - initialize team and court states
+  // Initialize team and court states from completed matches
   const teamStates = new Map<string | number, TeamState>();
   const courtStates: CourtState[] = courts.map(court => ({
     courtId: court.id,
-    availableAt: config.startTime || currentTime,
+    availableAt: earliestTime,
     currentMatch: null,
   }));
 
-  // Process completed matches to set resource availability
+  // Paint timeline: process completed matches to set resource availability
   for (const completed of config.completedMatches) {
     // Update court availability
     const court = courtStates.find(c => c.courtId === completed.courtId);
@@ -738,17 +958,16 @@ export function rescheduleMatches(
     }
 
     // Update team availability (with rest time)
-    const team1RestEnd = new Date(completed.actualEndTime.getTime() + restTime * 60000);
-    const team2RestEnd = new Date(completed.actualEndTime.getTime() + restTime * 60000);
+    const restEnd = new Date(completed.actualEndTime.getTime() + restTime * 60000);
 
-    const team1State = ensureTeamState(completed.team1Id, teamStates, currentTime);
-    if (team1RestEnd > team1State.availableAt) {
-      team1State.availableAt = team1RestEnd;
+    const team1State = ensureTeamState(completed.team1Id, teamStates, earliestTime);
+    if (restEnd > team1State.availableAt) {
+      team1State.availableAt = restEnd;
     }
 
-    const team2State = ensureTeamState(completed.team2Id, teamStates, currentTime);
-    if (team2RestEnd > team2State.availableAt) {
-      team2State.availableAt = team2RestEnd;
+    const team2State = ensureTeamState(completed.team2Id, teamStates, earliestTime);
+    if (restEnd > team2State.availableAt) {
+      team2State.availableAt = restEnd;
     }
   }
 
@@ -763,7 +982,6 @@ export function rescheduleMatches(
       remainingDependencies: new Set(deps),
     });
 
-    // Build reverse mapping
     for (const depId of deps) {
       if (!dependents.has(depId)) {
         dependents.set(depId, new Set());
@@ -772,199 +990,71 @@ export function rescheduleMatches(
     }
   }
 
-  // Initialize queue with matches whose dependencies are satisfied
-  // (either no dependencies, or all dependencies are in completed matches)
+  // Detect cycles in pending matches
+  detectCycles(matchMap);
+
+  // Resolve completed dependencies and initialize queue
   const queue = new MatchQueue();
-  for (const [matchId, task] of matchMap.entries()) {
-    // Check if all dependencies are satisfied (completed)
-    let allDepsSatisfied = true;
-    for (const depId of task.remainingDependencies) {
-      if (!completedMatchIds.has(depId)) {
-        allDepsSatisfied = false;
-        break;
+  for (const [, task] of matchMap.entries()) {
+    // Remove completed dependencies
+    for (const depId of [...task.remainingDependencies]) {
+      if (completedMatchIds.has(depId)) {
+        task.remainingDependencies.delete(depId);
       }
     }
 
-    if (allDepsSatisfied) {
-      task.remainingDependencies.clear();
+    if (task.remainingDependencies.size === 0) {
       queue.enqueue(task);
     }
   }
 
-  // Event queue for simulation
-  const events: Event[] = [];
-  let simTime = new Date(currentTime);
+  // Run the scheduling loop
+  const schedule: ScheduledMatch[] = [];
+  const ctx: SchedulerContext = {
+    queue,
+    events: [],
+    schedule,
+    teamStates,
+    courtStates,
+    dependents,
+    matchMap,
+    restTime,
+    courtSetupTime,
+    initialTime: earliestTime,
+    minStartTime: currentTime,  // Cannot schedule in the past
+    dayBoundaries: config.dayBoundaries || [],
+  };
 
-  // Main scheduling loop (similar to original but starting from current time)
-  while (!queue.isEmpty() || events.length > 0) {
-    // Process all events at current simulation time
-    while (events.length > 0 && events[0].time <= simTime) {
-      const event = events.shift()!;
-
-      // Free up the court
-      const court = courtStates.find(c => c.courtId === event.courtId);
-      if (court) {
-        court.currentMatch = null;
-        court.availableAt = new Date(event.time.getTime() + courtSetupTime * 60000);
-      }
-
-      // Free up teams and set their rest time
-      const restEndTime = new Date(event.time.getTime() + restTime * 60000);
-
-      const team1State = ensureTeamState(event.team1Id, teamStates, currentTime);
-      team1State.currentMatch = null;
-      team1State.availableAt = restEndTime;
-
-      const team2State = ensureTeamState(event.team2Id, teamStates, currentTime);
-      team2State.currentMatch = null;
-      team2State.availableAt = restEndTime;
-
-      // Unlock dependent matches
-      const deps = dependents.get(event.matchId) || new Set();
-      for (const depMatchId of deps) {
-        const depTask = matchMap.get(depMatchId);
-        if (depTask) {
-          depTask.remainingDependencies.delete(event.matchId);
-
-          // If all dependencies satisfied, add to queue
-          if (depTask.remainingDependencies.size === 0) {
-            queue.enqueue(depTask);
-          }
-        }
-      }
-    }
-
-    // Try to schedule matches from queue
-    let scheduled = false;
-    const queueSnapshot = queue.getAll();
-
-    for (const task of queueSnapshot) {
-      // Check if teams are available
-      if (!areTeamsAvailable(task.match, simTime, teamStates)) {
-        continue;
-      }
-
-      // Find available court
-      const courtResult = findAvailableCourt(simTime, courtStates);
-      if (!courtResult) {
-        continue;
-      }
-
-      // Calculate actual start time (respecting current time constraint)
-      const teamEarliestStart = calculateEarliestStartTime(task.match, simTime, teamStates);
-      const actualStartTime = new Date(Math.max(
-        courtResult.availableAt.getTime(),
-        teamEarliestStart.getTime(),
-        currentTime.getTime()  // CRITICAL: Cannot schedule in the past
-      ));
-
-      // If start time is in the future relative to sim time, skip for now
-      if (actualStartTime > simTime) {
-        continue;
-      }
-
-      // Schedule the match!
-      const endTime = new Date(actualStartTime.getTime() + task.match.duration * 60000);
-
-      schedule.push({
-        matchId: task.match.id,
-        courtId: courtResult.court.courtId,
-        startTime: actualStartTime,
-        endTime,
-        round: task.match.round,
-      });
-
-      // Update court state
-      courtResult.court.currentMatch = task.match.id;
-      courtResult.court.availableAt = endTime;
-
-      // Update team states
-      const teamIds = getTeamIds(task.match);
-      for (const teamId of teamIds) {
-        const teamState = ensureTeamState(teamId, teamStates, currentTime);
-        teamState.currentMatch = task.match.id;
-      }
-
-      // Create end event
-      events.push({
-        time: endTime,
-        type: 'MATCH_END',
-        matchId: task.match.id,
-        courtId: courtResult.court.courtId,
-        team1Id: teamIds[0],
-        team2Id: teamIds[1],
-      });
-
-      // Sort events by time
-      events.sort((a, b) => a.time.getTime() - b.time.getTime());
-
-      // Remove from queue
-      queue.remove(task.match.id);
-      scheduled = true;
-      break; // Start over to maintain priority order
-    }
-
-    // If nothing was scheduled, advance time to next event
-    if (!scheduled) {
-      if (events.length > 0) {
-        simTime = events[0].time;
-      } else if (!queue.isEmpty()) {
-        // No events but queue not empty - need to advance time
-        let nextTime = new Date(8640000000000000); // Max date
-
-        for (const state of teamStates.values()) {
-          if (state.availableAt > simTime && state.availableAt < nextTime) {
-            nextTime = state.availableAt;
-          }
-        }
-
-        for (const court of courtStates) {
-          if (court.availableAt > simTime && court.availableAt < nextTime) {
-            nextTime = court.availableAt;
-          }
-        }
-
-        // Also consider current time as minimum
-        if (currentTime > simTime && currentTime < nextTime) {
-          nextTime = currentTime;
-        }
-
-        if (nextTime.getTime() < 8640000000000000) {
-          simTime = nextTime;
-        } else {
-          throw new Error('Scheduling deadlock detected in reschedule mode');
-        }
-      } else {
-        break; // Done
-      }
-    }
-  }
+  runSchedulingLoop(ctx);
 
   // Verify all pending matches were scheduled
-  const scheduledPendingCount = schedule.filter(s => !completedMatchIds.has(s.matchId)).length;
-  if (scheduledPendingCount !== pendingMatches.length) {
+  if (schedule.length !== pendingMatches.length) {
+    const scheduledIds = new Set(schedule.map(s => s.matchId));
+    const unscheduled = pendingMatches.filter(m => !scheduledIds.has(m.id)).map(m => m.id);
     throw new Error(
       `Failed to reschedule all pending matches. ` +
-      `Scheduled: ${scheduledPendingCount}, Pending: ${pendingMatches.length}`
+      `Scheduled: ${schedule.length}, Pending: ${pendingMatches.length}. ` +
+      `Unscheduled: [${unscheduled.join(', ')}]`
     );
   }
 
-  // Filter to return only future matches (exclude completed)
-  const futureSchedule = schedule.filter(s => !completedMatchIds.has(s.matchId));
-
   // Calculate summary
-  const endTime = schedule.reduce(
-    (max, s) => s.endTime > max ? s.endTime : max,
+  const allEndTimes = [
+    ...schedule.map(s => s.endTime),
+    ...config.completedMatches.map(m => m.actualEndTime),
+  ];
+  const endTime = allEndTimes.reduce(
+    (max, t) => t > max ? t : max,
     currentTime
   );
 
-  const totalDuration = (endTime.getTime() - (config.startTime || currentTime).getTime()) / 60000;
-  const courtsUsedSet = new Set(futureSchedule.map(s => s.courtId));
+  const totalDuration = (endTime.getTime() - earliestTime.getTime()) / 60000;
+  const courtsUsedSet = new Set(schedule.map(s => s.courtId));
 
   return {
-    schedule: futureSchedule.sort((a, b) => a.startTime.getTime() - b.startTime.getTime()),
+    schedule: schedule.sort((a, b) => a.startTime.getTime() - b.startTime.getTime()),
     summary: {
-      totalMatches: futureSchedule.length,
+      totalMatches: schedule.length,
       totalDuration,
       courtsUsed: courtsUsedSet.size,
       endTime,

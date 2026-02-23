@@ -33,6 +33,7 @@ export {
   // Types and interfaces
   Match,
   Court,
+  DayBoundary,
   SchedulerConfig,
   RescheduleConfig,
   ScheduledMatch,
@@ -72,3 +73,37 @@ export {
   GeneratedMatch,
   TransitionResult,
 } from './crossoverEngine';
+
+// Match Generator
+export {
+  // Functions
+  estimateMatchDuration,
+  generateRoundRobinMatches,
+  generateBrazilianMatches,
+  generateKnockoutBracket,
+  generatePoolMatches,
+
+  // Types and interfaces
+  MatchFormatConfig,
+  PhaseType,
+  TournamentMatch,
+  KnockoutTeamEntry,
+} from './matchGenerator';
+
+// Tournament Orchestrator
+export {
+  // Main function
+  generateTournament,
+
+  // Helpers
+  validateTournamentConfig,
+  suggestPoolCount,
+
+  // Types and interfaces
+  PoolPhaseConfig,
+  QualificationTransitionConfig,
+  MainDrawConfig,
+  TournamentConfig,
+  TournamentPhase,
+  TournamentPlan,
+} from './tournamentOrchestrator';
