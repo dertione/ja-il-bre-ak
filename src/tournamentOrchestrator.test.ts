@@ -298,6 +298,61 @@ describe('generateTournament - main draw only', () => {
     // 4 pools of 4 (classic) = 6 * 4 = 24 pool matches
     expect(plan.phases[0].matches).toHaveLength(24);
   });
+
+  test('barrage 2c3: should generate 4 serpentin matches, 8-team QF knockout', () => {
+    const config: TournamentConfig = {
+      name: 'Barrage 2c3 + QF',
+      teams: makeTeams(16),
+      courts: makeCourts(3),
+      format: 'main-draw-only',
+      mainDraw: {
+        type: 'pools-then-knockout',
+        poolPhase: { poolCount: 4, poolFormat: 'classic', matchFormat: FORMAT_15 },
+        transition: { mode: 'barrage', matchFormat: FORMAT_15 },
+        knockout: { matchFormat: FORMAT_21 },
+      },
+      scheduling: { startTime: new Date('2024-06-15T08:00:00Z'), restTime: 15 },
+    };
+
+    const plan = generateTournament(config);
+
+    // 3 phases: pool, barrage, knockout
+    expect(plan.phases).toHaveLength(3);
+    expect(plan.phases[1].id).toBe('main-draw-transition');
+    expect(plan.phases[2].id).toBe('knockout');
+
+    // Barrage: 4 matches only (no Tour 2)
+    const barrage = plan.phases[1];
+    expect(barrage.matches).toHaveLength(4);
+
+    // Serpentin cross-pool: 2nd-A vs 3rd-D, 2nd-B vs 3rd-C, 2nd-C vs 3rd-B, 2nd-D vs 3rd-A
+    expect(barrage.matches[0].team1).toBe('2nd-MD-A');
+    expect(barrage.matches[0].team2).toBe('3rd-MD-D');
+    expect(barrage.matches[1].team1).toBe('2nd-MD-B');
+    expect(barrage.matches[1].team2).toBe('3rd-MD-C');
+    expect(barrage.matches[2].team1).toBe('2nd-MD-C');
+    expect(barrage.matches[2].team2).toBe('3rd-MD-B');
+    expect(barrage.matches[3].team1).toBe('2nd-MD-D');
+    expect(barrage.matches[3].team2).toBe('3rd-MD-A');
+
+    // Knockout: 8 teams → QF(4) + SF(2) + 3rd + Final = 8 matches
+    const ko = plan.phases[2];
+    expect(ko.matches).toHaveLength(8);
+    const qfMatches = ko.matches.filter(m => m.metadata?.knockoutStage === 'QF');
+    expect(qfMatches).toHaveLength(4);
+
+    // Pool winners vs barrage winners (serpentin seeding 1v8, 4v5, 2v7, 3v6)
+    expect(qfMatches[0].team1).toBe('1st-MD-A');
+    expect(qfMatches[0].team2).toBe('Winner MDT-B4-T1');
+    expect(qfMatches[1].team1).toBe('1st-MD-D');
+    expect(qfMatches[1].team2).toBe('Winner MDT-B1-T1');
+    expect(qfMatches[2].team1).toBe('1st-MD-B');
+    expect(qfMatches[2].team2).toBe('Winner MDT-B3-T1');
+    expect(qfMatches[3].team1).toBe('1st-MD-C');
+    expect(qfMatches[3].team2).toBe('Winner MDT-B2-T1');
+
+    expect(plan.summary.totalMatches).toBe(36); // 24 pool + 4 barrage + 8 knockout
+  });
 });
 
 // ─────────────────────────────────────────────────────────────

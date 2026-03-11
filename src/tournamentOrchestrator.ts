@@ -533,37 +533,25 @@ function generateMainDrawTransition(
     }
 
     case 'barrage': {
-      // Tour 1: 2nd vs 3rd from each pool
+      // Serpentin cross-pool: 2nd-A vs 3rd-D, 2nd-B vs 3rd-C, etc.
+      // Pool winners (1st) advance directly to knockout — no Tour 2.
       for (let i = 0; i < poolIds.length; i++) {
-        const poolId = poolIds[i];
-        const deps = poolMatchIds(mdPoolPhase.matches, poolId);
+        const pool1 = poolIds[i];
+        const pool2 = poolIds[poolIds.length - 1 - i];
+        const deps = [
+          ...poolMatchIds(mdPoolPhase.matches, pool1),
+          ...poolMatchIds(mdPoolPhase.matches, pool2),
+        ];
         matches.push({
           id: `MDT-B${i + 1}-T1`,
-          team1: `2nd-MD-${poolId}`,
-          team2: `3rd-MD-${poolId}`,
+          team1: `2nd-MD-${pool1}`,
+          team2: `3rd-MD-${pool2}`,
           round: 30,
           duration,
           dependencies: deps,
           phase,
           metadata: {
-            description: `MD Barrage T1: 2nd ${poolId} vs 3rd ${poolId}`,
-          },
-        });
-      }
-      // Tour 2: Tour 1 winners vs 1st
-      for (let i = 0; i < poolIds.length; i++) {
-        const poolId = poolIds[i];
-        const t1MatchId = `MDT-B${i + 1}-T1`;
-        matches.push({
-          id: `MDT-B${i + 1}-T2`,
-          team1: `Winner ${t1MatchId}`,
-          team2: `1st-MD-${poolId}`,
-          round: 31,
-          duration,
-          dependencies: [t1MatchId],
-          phase,
-          metadata: {
-            description: `MD Barrage T2: Winner B${i + 1} vs 1st ${poolId}`,
+            description: `MD Barrage: 2nd ${pool1} vs 3rd ${pool2}`,
           },
         });
       }
@@ -588,16 +576,13 @@ function generateMainDrawTransition(
 function generateKnockoutPhase(
   config: TournamentConfig,
   knockoutTeamCount: number,
-  priorPhaseMatchIds: string[]
+  priorPhaseMatchIds: string[],
+  entriesOverride?: KnockoutTeamEntry[]
 ): TournamentPhase {
-  const entries: KnockoutTeamEntry[] = [];
-  for (let i = 0; i < knockoutTeamCount; i++) {
-    entries.push({
-      teamId: `KO-seed-${i + 1}`,
-      seed: i + 1,
-      label: `Seed ${i + 1}`,
-    });
-  }
+  const entries: KnockoutTeamEntry[] = entriesOverride ?? Array.from(
+    { length: knockoutTeamCount },
+    (_, i) => ({ teamId: `KO-seed-${i + 1}`, seed: i + 1, label: `Seed ${i + 1}` })
+  );
 
   const matches = generateKnockoutBracket(
     entries,
@@ -661,7 +646,8 @@ function getKnockoutTeamCount(config: TournamentConfig, qualifiedCount: number):
   }
 
   if (mdTransition.mode === 'barrage') {
-    return mdPoolConfig.poolCount; // winners of barrage tour 2
+    // N pool winners (direct) + N barrage winners = 2N teams in knockout
+    return mdPoolConfig.poolCount * 2;
   }
 
   return mdPoolConfig.poolCount;
@@ -712,7 +698,26 @@ export function generateTournament(config: TournamentConfig): TournamentPlan {
       ? allMatchIds(phases[phases.length - 1].matches)
       : [];
 
-    const knockoutPhase = generateKnockoutPhase(config, knockoutTeamCount, priorKnockoutDeps);
+    let knockoutEntries: KnockoutTeamEntry[] | undefined;
+    if (config.mainDraw.transition?.mode === 'barrage' && mdPoolPhase.pools) {
+      const pIds = mdPoolPhase.pools.map(p => p.poolId).sort();
+      knockoutEntries = [
+        // Seeds 1..N : pool winners, direct qualifiers
+        ...pIds.map((pid, i) => ({
+          teamId: `ko-1st-${pid}`,
+          seed: i + 1,
+          label: `1st-MD-${pid}`,
+        })),
+        // Seeds N+1..2N : barrage match winners
+        ...pIds.map((_, i) => ({
+          teamId: `ko-bar-${i + 1}`,
+          seed: pIds.length + i + 1,
+          label: `Winner MDT-B${i + 1}-T1`,
+        })),
+      ];
+    }
+
+    const knockoutPhase = generateKnockoutPhase(config, knockoutTeamCount, priorKnockoutDeps, knockoutEntries);
     phases.push(knockoutPhase);
   } else {
     // direct-knockout
